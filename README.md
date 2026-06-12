@@ -12,15 +12,33 @@ npm install
 npm start            # http://localhost:3000
 ```
 
-Env vars: `PORT` (default 3000), `DB_PATH` (default `./whos-this.db`),
-`TRUST_PROXY=1` (set when behind a reverse proxy so rate limiting sees
-real client IPs).
+Env vars: `PORT` (default 3000), `TRUST_PROXY=1` (set when behind a
+reverse proxy so rate limiting sees real client IPs), and either
+`TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (hosted Turso database) or
+`DB_PATH` (local sqlite file, default `./whos-this.db`). With no env
+vars set it just uses the local file — fine for development.
 
 ## Hosting
 
-This app needs two things most "serverless" hosts don't give you: a
-long-running Node process and a disk that persists (SQLite is a file).
-So skip Vercel/Netlify. Two good options:
+### Option 0: Render free tier + Turso (free)
+
+Render's free filesystem is wiped on every deploy/restart/spin-down,
+so the database lives in Turso (hosted SQLite) instead:
+
+1. `turso db tokens create whos-this` (or dashboard → your database →
+   Generate Token) to get an auth token.
+2. In the Render service → Environment, set:
+   - `TURSO_DATABASE_URL` = `libsql://<your-db>.turso.io`
+   - `TURSO_AUTH_TOKEN` = the token from step 1
+   - `TRUST_PROXY` = `1`
+3. Push / redeploy.
+
+Caveat: the free web service still spins down after 15 idle minutes,
+so the first visit after a quiet period takes ~50s to load — but the
+data now survives it.
+
+The self-hosted options below keep the database as a plain local file
+(no Turso account needed):
 
 ### Option A: a small VPS + Caddy (most control, ~$5/mo)
 

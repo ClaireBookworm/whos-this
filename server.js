@@ -1,14 +1,18 @@
 // whos-this — group contact sharing. one file, no accounts, no build step.
 // run: node server.js   (PORT env optional, defaults 3000)
+// db: Turso when TURSO_DATABASE_URL is set, else a local sqlite file.
 const express = require('express');
-const Database = require('better-sqlite3');
+const { createClient } = require('@libsql/client');
 const crypto = require('crypto');
 const path = require('path');
 
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'whos-this.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-db.exec(`
+const db = createClient(
+  process.env.TURSO_DATABASE_URL
+    ? { url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN }
+    : { url: 'file:' + (process.env.DB_PATH || path.join(__dirname, 'whos-this.db')) }
+);
+
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS groups (
     slug        TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -18,7 +22,7 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS members (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_slug  TEXT NOT NULL REFERENCES groups(slug) ON DELETE CASCADE,
+    group_slug  TEXT NOT NULL REFERENCES groups(slug),
     name        TEXT NOT NULL,
     phone       TEXT NOT NULL,
     email       TEXT,
@@ -28,13 +32,24 @@ db.exec(`
     updated_at  INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_slug);
-`);
+`;
+
+// tiny query helpers over the async client
+const q = (sql, args = []) => db.execute({ sql, args });
+const one = async (sql, args) => (await q(sql, args)).rows[0];
+const all = async (sql, args) => (await q(sql, args)).rows;
 
 const app = express();
-// set TRUST_PROXY=1 when behind a reverse proxy (caddy/nginx/fly) so
+// set TRUST_PROXY=1 when behind a reverse proxy (render/caddy/nginx) so
 // req.ip is the real client, not the proxy — rate limiting depends on it
 if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 app.use(express.json({ limit: '16kb' }));
+
+// async handler wrapper — express 4 doesn't catch promise rejections
+const h = fn => (req, res) => fn(req, res).catch(e => {
+  console.error(e);
+  if (!res.headersSent) res.status(500).json({ error: 'server error' });
+});
 
 // ---------- helpers ----------
 const SLUG_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -128,60 +143,60 @@ setInterval(() => {
   }
 }, 5 * 60_000).unref();
 
-// groups untouched for 12 months get deleted (members cascade)
-function purgeStale() {
+// groups untouched for 12 months get deleted (members first — no cascade here)
+const STALE_SLUGS = `
+  SELECT g.slug FROM groups g LEFT JOIN members m ON m.group_slug = g.slug
+  GROUP BY g.slug HAVING COALESCE(MAX(m.updated_at), g.created_at) < ?`;
+async function purgeStale() {
   const cutoff = Date.now() - 365 * 24 * 3600 * 1000;
-  db.prepare(`
-    DELETE FROM groups WHERE slug IN (
-      SELECT g.slug FROM groups g LEFT JOIN members m ON m.group_slug = g.slug
-      GROUP BY g.slug HAVING COALESCE(MAX(m.updated_at), g.created_at) < ?
-    )`).run(cutoff);
+  await q(`DELETE FROM members WHERE group_slug IN (${STALE_SLUGS})`, [cutoff]);
+  await q(`DELETE FROM groups WHERE slug IN (${STALE_SLUGS})`, [cutoff]);
 }
-purgeStale();
-setInterval(purgeStale, 24 * 3600 * 1000).unref();
+setInterval(() => purgeStale().catch(e => console.error('purge failed:', e)),
+  24 * 3600 * 1000).unref();
 
-const getGroup = db.prepare('SELECT * FROM groups WHERE slug = ?');
-const getMembers = db.prepare('SELECT * FROM members WHERE group_slug = ? ORDER BY created_at, id');
+const getGroup = slug => one('SELECT * FROM groups WHERE slug = ?', [slug]);
+const getMembers = slug =>
+  all('SELECT * FROM members WHERE group_slug = ? ORDER BY created_at, id', [slug]);
 
 // ---------- api ----------
-app.post('/api/groups', rateLimit, (req, res) => {
+app.post('/api/groups', rateLimit, h(async (req, res) => {
   const err = checkName(req.body?.name);
   if (err) return res.status(400).json({ error: err });
   const name = req.body.name.trim();
   const admin_token = makeToken();
-  let slug;
   for (let i = 0; i < 5; i++) {
-    slug = makeSlug();
+    const slug = makeSlug();
     try {
-      db.prepare('INSERT INTO groups (slug, name, admin_token, created_at) VALUES (?,?,?,?)')
-        .run(slug, name, admin_token, Date.now());
+      await q('INSERT INTO groups (slug, name, admin_token, created_at) VALUES (?,?,?,?)',
+        [slug, name, admin_token, Date.now()]);
       return res.json({ slug, admin_token });
     } catch (e) { /* slug collision, retry */ }
   }
   res.status(500).json({ error: 'could not allocate slug' });
-});
+}));
 
-app.get('/api/groups/:slug', (req, res) => {
-  const g = getGroup.get(req.params.slug);
+app.get('/api/groups/:slug', h(async (req, res) => {
+  const g = await getGroup(req.params.slug);
   if (!g) return res.status(404).json({ error: 'no such group' });
-  const members = getMembers.all(g.slug).map(m => ({
-    id: m.id, name: m.name, phone: m.phone, phone_pretty: prettyPhone(m.phone),
-    email: m.email, note: m.note, updated_at: m.updated_at,
+  const members = (await getMembers(g.slug)).map(m => ({
+    id: Number(m.id), name: m.name, phone: m.phone, phone_pretty: prettyPhone(m.phone),
+    email: m.email, note: m.note, updated_at: Number(m.updated_at),
   }));
-  const updated_at = members.reduce((a, m) => Math.max(a, m.updated_at), g.created_at);
+  const updated_at = members.reduce((a, m) => Math.max(a, m.updated_at), Number(g.created_at));
   const body = JSON.stringify({ name: g.name, locked: !!g.locked, count: members.length, updated_at, members });
   const etag = '"' + crypto.createHash('sha1').update(body).digest('hex').slice(0, 16) + '"';
   res.set('ETag', etag);
   if (req.headers['if-none-match'] === etag) return res.status(304).end();
   res.type('application/json').send(body);
-});
+}));
 
-app.post('/api/groups/:slug/members', rateLimit, (req, res) => {
-  const g = getGroup.get(req.params.slug);
+app.post('/api/groups/:slug/members', rateLimit, h(async (req, res) => {
+  const g = await getGroup(req.params.slug);
   if (!g) return res.status(404).json({ error: 'no such group' });
   if (g.locked) return res.status(403).json({ error: 'group is locked' });
-  const count = db.prepare('SELECT COUNT(*) c FROM members WHERE group_slug = ?').get(g.slug).c;
-  if (count >= 500) return res.status(403).json({ error: 'group is full (500 max)' });
+  const { c } = await one('SELECT COUNT(*) c FROM members WHERE group_slug = ?', [g.slug]);
+  if (Number(c) >= 500) return res.status(403).json({ error: 'group is full (500 max)' });
   const { name, phone, email, note } = req.body || {};
   const err = checkName(name) || checkEmail(email) || checkNote(note);
   if (err) return res.status(400).json({ error: err });
@@ -189,14 +204,14 @@ app.post('/api/groups/:slug/members', rateLimit, (req, res) => {
   if (!normPhone) return res.status(400).json({ error: 'phone looks invalid (need at least 7 digits)' });
   const edit_token = makeToken();
   const now = Date.now();
-  const info = db.prepare(
-    'INSERT INTO members (group_slug, name, phone, email, note, edit_token, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)'
-  ).run(g.slug, name.trim(), normPhone, email || null, note || null, edit_token, now, now);
-  res.json({ member_id: info.lastInsertRowid, edit_token });
-});
+  const info = await q(
+    'INSERT INTO members (group_slug, name, phone, email, note, edit_token, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)',
+    [g.slug, name.trim(), normPhone, email || null, note || null, edit_token, now, now]);
+  res.json({ member_id: Number(info.lastInsertRowid), edit_token });
+}));
 
-app.put('/api/members/:id', rateLimit, (req, res) => {
-  const m = db.prepare('SELECT * FROM members WHERE id = ?').get(req.params.id);
+app.put('/api/members/:id', rateLimit, h(async (req, res) => {
+  const m = await one('SELECT * FROM members WHERE id = ?', [req.params.id]);
   if (!m) return res.status(404).json({ error: 'no such member' });
   const { edit_token, name, phone, email, note } = req.body || {};
   if (edit_token !== m.edit_token) return res.status(403).json({ error: 'bad edit token' });
@@ -204,41 +219,41 @@ app.put('/api/members/:id', rateLimit, (req, res) => {
   if (err) return res.status(400).json({ error: err });
   const normPhone = normalizePhone(phone || '');
   if (!normPhone) return res.status(400).json({ error: 'phone looks invalid (need at least 7 digits)' });
-  db.prepare('UPDATE members SET name=?, phone=?, email=?, note=?, updated_at=? WHERE id=?')
-    .run(name.trim(), normPhone, email || null, note || null, Date.now(), m.id);
+  await q('UPDATE members SET name=?, phone=?, email=?, note=?, updated_at=? WHERE id=?',
+    [name.trim(), normPhone, email || null, note || null, Date.now(), m.id]);
   res.json({ ok: true });
-});
+}));
 
-app.delete('/api/members/:id', rateLimit, (req, res) => {
-  const m = db.prepare('SELECT * FROM members WHERE id = ?').get(req.params.id);
+app.delete('/api/members/:id', rateLimit, h(async (req, res) => {
+  const m = await one('SELECT * FROM members WHERE id = ?', [req.params.id]);
   if (!m) return res.status(404).json({ error: 'no such member' });
   const token = req.body?.token || req.query.token;
-  const g = getGroup.get(m.group_slug);
+  const g = await getGroup(m.group_slug);
   if (token !== m.edit_token && token !== g.admin_token)
     return res.status(403).json({ error: 'bad token' });
-  db.prepare('DELETE FROM members WHERE id = ?').run(m.id);
+  await q('DELETE FROM members WHERE id = ?', [m.id]);
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/groups/:slug/lock', rateLimit, (req, res) => {
-  const g = getGroup.get(req.params.slug);
+app.post('/api/groups/:slug/lock', rateLimit, h(async (req, res) => {
+  const g = await getGroup(req.params.slug);
   if (!g) return res.status(404).json({ error: 'no such group' });
   if (req.body?.admin_token !== g.admin_token) return res.status(403).json({ error: 'bad admin token' });
   const locked = g.locked ? 0 : 1;
-  db.prepare('UPDATE groups SET locked = ? WHERE slug = ?').run(locked, g.slug);
+  await q('UPDATE groups SET locked = ? WHERE slug = ?', [locked, g.slug]);
   res.json({ locked: !!locked });
-});
+}));
 
 // ---------- the product ----------
-app.get('/g/:slug/contacts.vcf', (req, res) => {
-  const g = getGroup.get(req.params.slug);
+app.get('/g/:slug/contacts.vcf', h(async (req, res) => {
+  const g = await getGroup(req.params.slug);
   if (!g) return res.status(404).send('no such group');
-  const members = getMembers.all(g.slug);
+  const members = await getMembers(g.slug);
   const safeName = g.name.replace(/[^\w \-]/g, '').trim().replace(/ +/g, '-') || 'contacts';
   res.set('Content-Type', 'text/vcard; charset=utf-8');
   res.set('Content-Disposition', `attachment; filename="${safeName}.vcf"`);
   res.send(buildVcf(g, members));
-});
+}));
 
 // ---------- pages ----------
 const CSS = `
@@ -470,11 +485,14 @@ setInterval(load, 30000);
 }
 
 app.get('/', (_req, res) => res.type('html').send(HOME_HTML));
-app.get('/g/:slug', (req, res) => {
-  if (!getGroup.get(req.params.slug)) return res.status(404).type('html')
+app.get('/g/:slug', h(async (req, res) => {
+  if (!await getGroup(req.params.slug)) return res.status(404).type('html')
     .send('<h1>group not found</h1><p>it may have expired (groups untouched for 12 months are deleted) or the link is wrong.</p>');
   res.type('html').send(groupHtml(req.params.slug));
-});
+}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`whos-this listening on http://localhost:${PORT}`));
+db.executeMultiple(SCHEMA)
+  .then(() => purgeStale())
+  .then(() => app.listen(PORT, () => console.log(`whos-this listening on http://localhost:${PORT}`)))
+  .catch(e => { console.error('db init failed:', e); process.exit(1); });
